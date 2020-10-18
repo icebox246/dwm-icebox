@@ -56,10 +56,11 @@
 #define HEIGHT(X)               ((X)->h + 2 * (X)->bw)
 #define TAGMASK                 ((1 << LENGTH(tags)) - 1)
 #define TEXTW(X)                (drw_fontset_getwidth(drw, (X)) + lrpad)
+#define MON4TAG(X)				((tagm[X]>=mon_c ? mon_c -1 : tagm[X]))
 
 /* enums */
 enum { CurNormal, CurResize, CurMove, CurLast }; /* cursor */
-enum { SchemeNorm, SchemeSel }; /* color schemes */
+enum { SchemeNorm, SchemeSel, SchemeNOther, SchemeSOther }; /* color schemes */
 enum { NetSupported, NetWMName, NetWMState, NetWMCheck,
        NetWMFullscreen, NetActiveWindow, NetWMWindowType,
        NetWMWindowTypeDialog, NetClientList, NetLast }; /* EWMH atoms */
@@ -178,6 +179,7 @@ static int gettextprop(Window w, Atom atom, char *text, unsigned int size);
 static void grabbuttons(Client *c, int focused);
 static void grabkeys(void);
 static void incnmaster(const Arg *arg);
+static Monitor *idtomon(unsigned int id);
 static void keypress(XEvent *e);
 static void killclient(const Arg *arg);
 static void manage(Window w, XWindowAttributes *wa);
@@ -213,6 +215,8 @@ static void sigchld(int unused);
 static void spawn(const Arg *arg);
 static void tag(const Arg *arg);
 static void tagmon(const Arg *arg);
+static void tagothermon(const Arg *arg);
+static void _tagothermon(const unsigned int id);
 static void tile(Monitor *);
 static void togglebar(const Arg *arg);
 static void togglefloating(const Arg *arg);
@@ -232,6 +236,7 @@ static void updatetitle(Client *c);
 static void updatewindowtype(Client *c);
 static void updatewmhints(Client *c);
 static void view(const Arg *arg);
+static void viewmon(unsigned int id);
 static Client *wintoclient(Window w);
 static Monitor *wintomon(Window w);
 static int xerror(Display *dpy, XErrorEvent *ee);
@@ -272,6 +277,7 @@ static Display *dpy;
 static Drw *drw;
 static Monitor *mons, *selmon;
 static Window root, wmcheckwin;
+static int mon_c = 0;
 
 /* configuration, allows nested code to access above variables */
 #include "config.h"
@@ -314,6 +320,10 @@ applyrules(Client *c)
 	if (ch.res_name)
 		XFree(ch.res_name);
 	c->tags = c->tags & TAGMASK ? c->tags & TAGMASK : c->mon->tagset[c->mon->seltags];
+	i = 0;
+   	unsigned int ti = c->tags;
+	while(ti>>=1) i++;
+	c->mon = idtomon(MON4TAG(i));
 }
 
 int
@@ -514,6 +524,7 @@ void
 cleanupmon(Monitor *mon)
 {
 	Monitor *m;
+	mon_c--;
 
 	if (mon == mons)
 		mons = mons->next;
@@ -648,9 +659,12 @@ Monitor *
 createmon(void)
 {
 	Monitor *m;
+	mon_c++;
 
 	m = ecalloc(1, sizeof(Monitor));
-	m->tagset[0] = m->tagset[1] = 1;
+	int t = 0;
+	while(MON4TAG(t)!=mon_c-1) t++;
+	m->tagset[0] = m->tagset[1] = 1<<t;
 	m->mfact = mfact;
 	m->nmaster = nmaster;
 	m->showbar = showbar;
@@ -720,11 +734,11 @@ drawbar(Monitor *m)
 	Client *c;
 
 	/* draw status first so it can be overdrawn by tags later */
-	if (m == selmon) { /* status is only drawn on selected monitor */
+	//if (m == selmon) { /* status is only drawn on selected monitor */
 		drw_setscheme(drw, scheme[SchemeNorm]);
 		tw = TEXTW(stext) - lrpad + 2; /* 2px right padding */
 		drw_text(drw, m->ww - tw, 0, tw, bh, 0, stext, 0);
-	}
+	//}
 
 	for (c = m->clients; c; c = c->next) {
 		occ |= c->tags;
@@ -734,7 +748,12 @@ drawbar(Monitor *m)
 	x = 0;
 	for (i = 0; i < LENGTH(tags); i++) {
 		w = TEXTW(tags[i]);
-		drw_setscheme(drw, scheme[m->tagset[m->seltags] & 1 << i ? SchemeSel : SchemeNorm]);
+		if(MON4TAG(i)==m->num) {
+			drw_setscheme(drw, scheme[(m->tagset[m->seltags] & 1 << i) && selmon==m ? SchemeSel : SchemeNorm]);
+		} else {
+			Monitor *mo = idtomon(MON4TAG(i));
+			drw_setscheme(drw, scheme[mo->tagset[mo->seltags] & 1 << i ? SchemeSOther : SchemeNOther]);
+		}
 		drw_text(drw, x, 0, w, bh, lrpad / 2, tags[i], urg & 1 << i);
 		if (occ & 1 << i)
 			drw_rect(drw, x + boxs, boxs, boxw, boxw,
@@ -765,9 +784,9 @@ void
 drawbars(void)
 {
 	Monitor *m;
-
-	for (m = mons; m; m = m->next)
+	for (m = mons; m; m = m->next) {
 		drawbar(m);
+	}
 }
 
 void
@@ -847,6 +866,7 @@ focusmon(const Arg *arg)
 	selmon = m;
 	focus(NULL);
 }
+
 
 void
 focusstack(const Arg *arg)
@@ -987,6 +1007,14 @@ incnmaster(const Arg *arg)
 {
 	selmon->nmaster = MAX(selmon->nmaster + arg->i, 0);
 	arrange(selmon);
+}
+
+Monitor
+*idtomon(unsigned int id)
+{
+	Monitor *m;
+	for(m = mons; m->next && m->num!=id; m = m->next);
+	return m;
 }
 
 #ifdef XINERAMA
@@ -1692,6 +1720,11 @@ tag(const Arg *arg)
 {
 	if (selmon->sel && arg->ui & TAGMASK) {
 		selmon->sel->tags = arg->ui & TAGMASK;
+		int i = 0, ti = arg->ui;	
+		while(ti>>=1) i++;
+		if(selmon->num != MON4TAG(i)) {
+			_tagothermon(MON4TAG(i));
+		}	
 		focus(NULL);
 		arrange(selmon);
 	}
@@ -1703,6 +1736,31 @@ tagmon(const Arg *arg)
 	if (!selmon->sel || !mons->next)
 		return;
 	sendmon(selmon->sel, dirtomon(arg->i));
+}
+
+void
+_tagothermon(const unsigned int id)
+{
+	Client *sel;
+	Monitor *newmon;
+
+	if (!selmon->sel || !mons->next)
+		return;
+	sel = selmon->sel;
+	unsigned int t = sel->tags;
+	newmon = idtomon(id);
+	sendmon(sel, newmon);
+	if (t & TAGMASK) {
+		sel->tags = t & TAGMASK;
+		focus(NULL);
+		arrange(newmon);
+	}
+}
+
+void
+tagothermon(const Arg *arg)
+{
+	_tagothermon(arg->ui);
 }
 
 void
@@ -2071,13 +2129,23 @@ updatewmhints(Client *c)
 void
 view(const Arg *arg)
 {
-	if ((arg->ui & TAGMASK) == selmon->tagset[selmon->seltags])
-		return;
-	selmon->seltags ^= 1; /* toggle sel tagset */
+	if(arg->ui != ~0 && arg->ui != 0) {
+		int i = 0, ti = arg->ui;
+		while(ti>>=1) i++;
+		viewmon(MON4TAG(i));
+	}
+	if ((arg->ui & TAGMASK) != selmon->tagset[selmon->seltags])
+		selmon->seltags ^= 1; /* toggle sel tagset */
 	if (arg->ui & TAGMASK)
 		selmon->tagset[selmon->seltags] = arg->ui & TAGMASK;
 	focus(NULL);
 	arrange(selmon);
+}
+
+void
+viewmon(unsigned int id)
+{
+	selmon = idtomon(id);	
 }
 
 Client *
